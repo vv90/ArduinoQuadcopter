@@ -11,6 +11,9 @@
 #define ESC2_REGISTER OCR4A
 #define ESC3_REGISTER OCR4B
 #define ESC4_REGISTER OCR4C
+#define SERVO1_REGISTER OCR5A
+#define SERVO2_REGISTER OCR5B
+#define SERVO3_REGISTER OCR5C
 
 #define _SETBIT(port, bit) (port |= _BV(bit))
 #define _CLEARBIT(port, bit) (port &= ~_BV(bit))
@@ -21,21 +24,30 @@ typedef struct PID {
 	double iGain;
 	double dGain;
 	int maxValue;
+
+	double iState;
+	double dState;
 };
 
-typedef struct PIDValue
-{
-	double pValue;
-	double iValue;
-	double dValue;
-	double lastError;
-};
+//typedef struct PIDValue
+//{
+//	double pValue;
+//	double iValue;
+//	double dValue;
+//	double lastError;
+//};
 
 typedef struct Attitude
 {
 	double pitch;
 	double roll;
 	double yaw;
+};
+
+typedef struct ISREvent
+{
+	unsigned long clock;
+	uint8_t state;
 };
 
 enum State { disarmed, armed, flying };
@@ -70,17 +82,24 @@ int ledBlinkDuration = 0;
 unsigned long currentTime = 0;
 unsigned long lastLedBlinkUpdateTime = 0;
 
-PID rollPID = { 0.8, 0.02, 8.0, 400 };
+PID rollPID = { 2.0, 0.04, 15.0, 400, 0, 0 };
 PID pitchPID = rollPID;//{ 1.4, 0.01, 15.0, 400 };
-PID yawPID = { 1.0, 0.02, 0.0, 400 };
+PID yawPID = { 3.0, 0.02, 0.0, 400, 0, 0 };
 
-PIDValue pitchPIDValue = { 0, 0, 0, 0 };
-PIDValue rollPIDValue = { 0, 0, 0, 0 };
-PIDValue yawPIDValue = { 0, 0, 0, 0 };
+//PIDValue pitchPIDValue = { 0, 0, 0, 0 };
+//PIDValue rollPIDValue = { 0, 0, 0, 0 };
+//PIDValue yawPIDValue = { 0, 0, 0, 0 };
 
 unsigned long isr_currentTime = 0;
+unsigned long isr_currentClock = 0;
 byte isr_receiverLastPinValue[5] = { 0, 0, 0, 0, 0 };
 unsigned long isr_receiverPulseStartTime[5] = { 0, 0, 0, 0, 0 };
+unsigned long isr_receiverPulseEndTime[5] = { 0, 0, 0, 0, 0 };
+
+volatile uint16_t isr_eventClock[16];
+volatile uint8_t isr_eventState[16];
+volatile uint8_t isr_currentEventIndex;
+uint8_t isr_processingEventIndex;
 
 //double att_gyro_roll = 0;
 //double att_gyro_pitch = 0;
@@ -101,9 +120,15 @@ bool mpu_calibrated = false;
 void setupInterrupts()
 {
 	//cli();
+
+	//_CLEARBIT(TIMSK0, TOIE0);
+
+
+
 	// configure timer 3 and timer 4
 	// timer 3 controls pins 2, 3, 5
 	// timer 4 controls pins 6, 7, 8
+	// timer 5 controls pins 46, 45, 44
 
 	// set fastPWM mode, prescaler 1/8
 	// set the TOP value for timer counter to ICR3 register value
@@ -114,19 +139,41 @@ void setupInterrupts()
 	TCCR4A = (_BV(COM4A1) | _BV(COM4B1) | _BV(COM4C1) | _BV(WGM41));
 	TCCR4B = (_BV(WGM43) | _BV(WGM42) | _BV(CS41));
 
-	//Serial.print(TCCR3A);
-	//Serial.print("\t");
-	//Serial.print(TCCR4A);
-	//Serial.print("\n");
-	//Serial.print(TCCR3B);
-	//Serial.print("\t");
-	//Serial.print(TCCR4B);
-	//Serial.print("\n");
+	TCCR5A = (_BV(COM5A1) | _BV(COM5B1) | _BV(COM5C1) | _BV(WGM51));
+	TCCR5B = (_BV(WGM53) | _BV(WGM52) | _BV(CS51));
+
+	Serial.print(TCCR0A);
+	Serial.print("\t");
+	Serial.print(TCCR1A);
+	Serial.print("\t");
+	Serial.print(TCCR2A);
+	Serial.print("\t");
+	Serial.print(TCCR3A);
+	Serial.print("\t");
+	Serial.print(TCCR4A);
+	Serial.print("\t");
+	Serial.print(TCCR5A);
+	Serial.print("\n");
+	Serial.print(TCCR0B);
+	Serial.print("\t");
+	Serial.print(TCCR1B);
+	Serial.print("\t");
+	Serial.print(TCCR2B);
+	Serial.print("\t");
+	Serial.print(TCCR3B);
+	Serial.print("\t");
+	Serial.print(TCCR4B);
+	Serial.print("\t");
+	Serial.print(TCCR5B);
+	Serial.print("\n");
 
 	// set the ICR3 register value which is used as the timer counter TOP value
 	// with tick_length = 0.5 microseconds and ICR3 = 7999 this gives us 4 millisecond period or 250Hz PWM frequency
 	ICR3 = 7999;
 	ICR4 = 7999;
+
+	// set timer 5 PWM frequency to 50Hz to drive servos
+	ICR5 = 39999;
 
 	// enable timer 3 overflow interrupt
 	//_SETBIT(TIMSK3, TOIE3);
@@ -152,19 +199,37 @@ void setup()
 	Serial.begin(57600);
 	Wire.begin();
 
-  Serial.print(rollPID.pGain);
-  Serial.print("\t");
-  Serial.print(rollPID.iGain);
-  Serial.print("\t");
-  Serial.print(rollPID.dGain);
-  Serial.print("\n");
+	Serial.print("Roll PID:\t");
+	Serial.print(rollPID.pGain);
+	Serial.print("\t");
+	Serial.print(rollPID.iGain);
+	Serial.print("\t");
+	Serial.print(rollPID.dGain);
+	Serial.print("\n");
+	Serial.print("Pitch PID:\t");
+	Serial.print(pitchPID.pGain);
+	Serial.print("\t");
+	Serial.print(pitchPID.iGain);
+	Serial.print("\t");
+	Serial.print(pitchPID.dGain);
+	Serial.print("\n");
+	Serial.print("Yaw PID:\t");
+	Serial.print(yawPID.pGain);
+	Serial.print("\t");
+	Serial.print(yawPID.iGain);
+	Serial.print("\t");
+	Serial.print(yawPID.dGain);
+	Serial.print("\n");
 
 	// use pins 5, 6, 7, 8 for PWM output
 	pinMode(5, OUTPUT);
 	pinMode(6, OUTPUT);
 	pinMode(7, OUTPUT);
 	pinMode(8, OUTPUT);
-	
+	pinMode(44, OUTPUT);
+	pinMode(45, OUTPUT);
+	pinMode(46, OUTPUT);
+
 	pinMode(41, OUTPUT);
 
 	MpuInit();
@@ -175,10 +240,19 @@ void setup()
 	setupInterrupts();
 
 	// set initial PWM pulse length to ESCs
-	setESC(1, 1000);
-	setESC(2, 1000);
-	setESC(3, 1000);
-	setESC(4, 1000);
+	//setESC(1, 1000);
+	//setESC(2, 1000);
+	//setESC(3, 1000);
+	//setESC(4, 1000);
+
+	setPWM(ESC1_REGISTER, 1000);
+	setPWM(ESC2_REGISTER, 1000);
+	setPWM(ESC3_REGISTER, 1000);
+	setPWM(ESC4_REGISTER, 1000);
+
+	setPWM(SERVO1_REGISTER, 1520);
+	setPWM(SERVO2_REGISTER, 1500);
+	setPWM(SERVO3_REGISTER, 1530);
 
 	calibrateGyro();
 
@@ -191,7 +265,8 @@ void setup()
 		receiverInput[3] < 1000)
 	{
 		//printReceiverInput();
-		delay(100);
+		processInterruptEvents();
+		delayMicroseconds(1000);
 	}
 	Serial.print("Receiver signal aquired\n");
 
@@ -200,26 +275,37 @@ void setup()
 
 void loop()
 {
-	//while (micros() < currentTime + 4000) 
-	//{}
+	// force the loop to run at exactly 250Hz to get a steady sampling rate
+	while (micros() < currentTime + 4000) 
+	{
+	}
+
+
+	//Serial.print(isr_lastEventIndex);
+	//Serial.print("\n");
 
 	currentTime = micros();
 
+	_TOGGLEBIT(PORTG, PG0);
+
+
+	
+	processInterruptEvents();
 	updateState();
 	blinkLed();
-	
 	updateMPUReadings();
 
 	updateAttitude();
 
 	// use 80/20 complementary filter on gyro input
-	//gyroRollInput = gyroRollInput * 0.8 + mpu_rot_x * 0.2;
-	//gyroPitchInput = gyroPitchInput * 0.8 + mpu_rot_y * 0.2;
-	//gyroYawInput = gyroYawInput * 0.8 + mpu_rot_z * -0.2;
 
 	gyroInput.roll = gyroInput.roll * 0.8 + mpu_rot_x * 0.2;
 	gyroInput.pitch = gyroInput.pitch * 0.8 + mpu_rot_y * 0.2;
 	gyroInput.yaw = gyroInput.yaw * 0.8 + mpu_rot_z * -0.2;
+
+	//gyroInput.roll = mpu_rot_x;
+	//gyroInput.pitch = mpu_rot_y;
+	//gyroInput.yaw = mpu_rot_z * -1;
 
 	throttle = receiverInput[2];
 
@@ -271,9 +357,9 @@ void loop()
 		//roll = calculatePID(rollPID, gyroRollInput, rollSetPoint, rollPIDValue);
 		//yaw = calculatePID(yawPID, gyroYawInput, yawSetPoint, yawPIDValue);
 
-		correction.pitch = calculatePID(pitchPID, gyroInput.pitch, setPoint.pitch, pitchPIDValue);
-		correction.roll = calculatePID(rollPID, gyroInput.roll, setPoint.roll, rollPIDValue);
-		correction.yaw = calculatePID(yawPID, gyroInput.yaw, setPoint.yaw, yawPIDValue);
+		correction.pitch = calculatePID(&pitchPID, gyroInput.pitch, setPoint.pitch);
+		correction.roll = calculatePID(&rollPID, gyroInput.roll, setPoint.roll);
+		correction.yaw = calculatePID(&yawPID, gyroInput.yaw, setPoint.yaw);
 
 		escOutput[0] = throttle + correction.pitch + correction.roll - correction.yaw;
 		escOutput[1] = throttle + correction.pitch - correction.roll + correction.yaw;
@@ -309,11 +395,22 @@ void loop()
 
 
 	
-	setESC(1, escOutput[0]);
-	setESC(2, escOutput[1]);
-	setESC(3, escOutput[2]);
-	setESC(4, escOutput[3]);
+	//setESC(1, escOutput[0]);
+	//setESC(2, escOutput[1]);
+	//setESC(3, escOutput[2]);
+	//setESC(4, escOutput[3]);
 	
+	setPWM(ESC1_REGISTER, escOutput[0]);
+	setPWM(ESC2_REGISTER, escOutput[1]);
+	setPWM(ESC3_REGISTER, escOutput[2]);
+	setPWM(ESC4_REGISTER, escOutput[3]);
+
+	//setPWM(SERVO2_REGISTER, servoDegreesToPulseLength(currentAttitude.pitch * -1));
+
+	//setPWM(SERVO1_REGISTER, receiverInput[0]);
+	//setPWM(SERVO2_REGISTER, receiverInput[1]);
+	//setPWM(SERVO3_REGISTER, receiverInput[3]);
+
 	//printSetPoints();
 	//printAttitude();
 	//printReceiverInput();
@@ -410,9 +507,16 @@ void updateState()
 		receiverInput[2] > 1050)
 	{
 		// clear PID memory before takeoff
-		pitchPIDValue = { 0, 0, 0, 0 };
-		rollPIDValue = { 0, 0, 0, 0 };
-		yawPIDValue = { 0, 0, 0, 0 };
+		pitchPID.iState = 0;
+		pitchPID.dState = 0;
+		rollPID.iState = 0;
+		rollPID.dState = 0;
+		yawPID.iState = 0;
+		yawPID.dState = 0;
+
+		//pitchPIDValue = { 0, 0, 0, 0 };
+		//rollPIDValue = { 0, 0, 0, 0 };
+		//yawPIDValue = { 0, 0, 0, 0 };
 
 		state = flying;
 	}
@@ -448,26 +552,45 @@ void updateMPUReadings()
 	mpu_accel_x *= -1;
 }
 
-double calculatePID(PID pid, double gyroInput, double setPoint, PIDValue &value)
+double calculatePID(PID * pid, double gyroInput, double setPoint)
 {
 	double error = gyroInput - setPoint;
-	value.iValue += pid.iGain * error;
+	double pTerm, iTerm, dTerm;
+	//value.iValue += pid.iGain * error;
+	pid->iState += pid->iGain * error;
 
-	if (value.iValue > pid.maxValue)
-		value.iValue = pid.maxValue;
-	else if (value.iValue < pid.maxValue * -1)
-		value.iValue = pid.maxValue * -1;
+	//if (value.iValue > pid.maxValue)
+	//	value.iValue = pid.maxValue;
+	//else if (value.iValue < pid.maxValue * -1)
+	//	value.iValue = pid.maxValue * -1;
 
-	value.pValue = pid.pGain * error;
-	value.dValue = pid.dGain * (error - value.lastError);
-	value.lastError = error;
+	if (pid->iState > pid->maxValue)
+		pid->iState = pid->maxValue;
+	else if (pid->iState < pid->maxValue * -1)
+		pid->iState = pid->maxValue * -1;
 
-	double result = value.pValue + value.iValue + value.dValue;
+	pTerm = pid->pGain * error;
+	iTerm = pid->iState;
+	dTerm = pid->dGain * (gyroInput - pid->dState);
 
-	if (result > pid.maxValue)
-		result = pid.maxValue;
-	else if (result < pid.maxValue * -1)
-		result = pid.maxValue * -1;
+	pid->dState = gyroInput;
+
+	//value.dValue = pid.dGain * (error - value.lastError);
+	//value.lastError = error;
+
+	//double result = value.pValue + value.iValue + value.dValue;
+
+	//if (result > pid.maxValue)
+	//	result = pid.maxValue;
+	//else if (result < pid.maxValue * -1)
+	//	result = pid.maxValue * -1;
+
+	double result = pTerm + iTerm + dTerm;
+
+	if (result > pid->maxValue)
+		result = pid->maxValue;
+	else if (result < pid->maxValue * -1)
+		result = pid->maxValue * -1;
 
 	return result;
 }
@@ -488,6 +611,21 @@ int toAngle(int receiverInput, int reverceChannel)
 		return ((receiverInput - 1492) * ((double)attMaxRoll / 492)) * reverceChannel;
 	else
 		return 0;
+}
+
+int servoDegreesToPulseLength(double degrees)
+{
+	double maxAngle = 30;
+	double offset = -3;
+	double gain = 0.8;
+	int oneDegreePulse = (500 / (maxAngle)) * gain;
+
+	if (degrees > maxAngle)
+		degrees = maxAngle;
+	else if (degrees < maxAngle * -1)
+		degrees = maxAngle * -1;
+
+	return 1500 + (degrees - offset) * oneDegreePulse;
 }
 
 void blinkLed()
@@ -532,7 +670,18 @@ void setESC(int escNumber, int pulseLength)
 	}
 }
 
-inline void updateReceiverChannelInput(int const &port, int const &pinRegister, int const &channel, int const &currentTime)
+void setPWM(volatile uint16_t &reg, int pulseLength)
+{
+	if (pulseLength < 1000)
+		pulseLength = 1000;
+
+	if (pulseLength > 2000)
+		pulseLength = 2000;
+
+	reg = pulseLength * 2;
+}
+
+__attribute__((always_inline)) void updateReceiverChannelInput(int const &port, int const &pinRegister, int const &channel, unsigned long const &currentClock)
 {
 	// if pin is HIGH
 	if (port & pinRegister)
@@ -543,7 +692,7 @@ inline void updateReceiverChannelInput(int const &port, int const &pinRegister, 
 			isr_receiverLastPinValue[channel] = 1;
 
 			// save the pulse start time
-			isr_receiverPulseStartTime[channel] = currentTime;
+			isr_receiverPulseStartTime[channel] = currentClock; //currentTime;
 		}
 	}
 	// if pin is LOW
@@ -556,8 +705,27 @@ inline void updateReceiverChannelInput(int const &port, int const &pinRegister, 
 			isr_receiverLastPinValue[channel] = 0;
 
 			// save the pulse duration
-			receiverInput[channel] = currentTime - isr_receiverPulseStartTime[channel];
+			receiverInput[channel] = currentClock > isr_receiverPulseStartTime[channel]
+				? (currentClock - isr_receiverPulseStartTime[channel]) / 2 // note: 1 timer tick = 0.5 microseconds
+				: ((ICR5 - isr_receiverPulseStartTime[channel]) + currentClock) / 2; // in case counter overflow happens
+				//currentTime - isr_receiverPulseStartTime[channel];
 		}
+	}
+}
+
+void processInterruptEvents()
+{
+	while (isr_processingEventIndex != isr_currentEventIndex)
+	{
+		uint8_t state = isr_eventState[isr_processingEventIndex];
+		unsigned long clock = isr_eventClock[isr_processingEventIndex];
+
+		updateReceiverChannelInput(state, RECEIVER_CHANNEL_0_MASK, 0, clock);
+		updateReceiverChannelInput(state, RECEIVER_CHANNEL_1_MASK, 1, clock);
+		updateReceiverChannelInput(state, RECEIVER_CHANNEL_2_MASK, 2, clock);
+		updateReceiverChannelInput(state, RECEIVER_CHANNEL_3_MASK, 3, clock);
+
+		isr_processingEventIndex = (isr_processingEventIndex + 1) & B1111;
 	}
 }
 
@@ -565,12 +733,52 @@ inline void updateReceiverChannelInput(int const &port, int const &pinRegister, 
 // this subroutine is called each time pin 50, 51, 52 or 53 changes value
 ISR(PCINT0_vect)
 {
-	isr_currentTime = micros();
+	//isr_currentTime = micros();
+	// get the current clock from timer 5 that runs with 1/8 prescaler
+	// that lets us measure time with accuracy of 0.5 microseconds
+	//isr_currentClock = TCNT5;
 
-	updateReceiverChannelInput(PINB, RECEIVER_CHANNEL_0_MASK, 0, isr_currentTime);
-	updateReceiverChannelInput(PINB, RECEIVER_CHANNEL_1_MASK, 1, isr_currentTime);
-	updateReceiverChannelInput(PINB, RECEIVER_CHANNEL_2_MASK, 2, isr_currentTime);
-	updateReceiverChannelInput(PINB, RECEIVER_CHANNEL_3_MASK, 3, isr_currentTime);
+	//isr_events[isr_lastEventIndex].clock = TCNT5;
+	//isr_events[isr_lastEventIndex].state = PINB;
+	isr_eventClock[isr_currentEventIndex] = TCNT5;
+	isr_eventState[isr_currentEventIndex] = PINB;
+	isr_currentEventIndex = (isr_currentEventIndex + 1) & B1111;
+
+	//updateReceiverChannelInput(PINB, RECEIVER_CHANNEL_0_MASK, 0, isr_currentClock);
+	//updateReceiverChannelInput(PINB, RECEIVER_CHANNEL_1_MASK, 1, isr_currentClock);
+	//updateReceiverChannelInput(PINB, RECEIVER_CHANNEL_2_MASK, 2, isr_currentClock);
+	//updateReceiverChannelInput(PINB, RECEIVER_CHANNEL_3_MASK, 3, isr_currentClock);
+
+	//if (PINB & RECEIVER_CHANNEL_0_MASK)
+	//{
+	//	if (isr_receiverLastPinValue[0] == 0)
+	//	{
+	//		// save current pin value
+	//		isr_receiverLastPinValue[0] = 1;
+	//
+	//		// save the pulse start time
+	//		isr_receiverPulseStartTime[0] = isr_currentClock; //currentTime;
+	//	}
+	//}
+	//else
+	//{
+	//	// if pin value changed from 1 to 0
+	//	if (isr_receiverLastPinValue[0] == 1)
+	//	{
+	//		// save current pin value
+	//		isr_receiverLastPinValue[0] = 0;
+	//
+	//		// save the pulse duration
+	//		receiverInput[0] = isr_currentClock > isr_receiverPulseStartTime[0]
+	//			? (isr_currentClock - isr_receiverPulseStartTime[0]) / 2 // note: 1 timer tick = 0.5 microseconds
+	//			: ((ICR5 - isr_receiverPulseStartTime[0]) + isr_currentClock) / 2; // in case counter overflow happens
+	//																				 //currentTime - isr_receiverPulseStartTime[channel];
+	//	}
+	//}
+
+	//unsigned long t = TCNT5;
+	//Serial.print(t - isr_currentClock);
+	//Serial.print("\n");
 }
 
 ISR(PCINT1_vect) 
